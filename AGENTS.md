@@ -48,3 +48,22 @@ These instructions apply to work in this repository.
 - If backlight is OFF, toggle TCA `P0` and `P1` (some boards swap BL/RST).
 - If display is washed out or mirrored, adjust ST7796 rotation/invert.
 - If SPI errors, double-check `SCLK/MOSI/DC` pins and that `CS` is `-1`.
+
+**Hardware Configuration: NRF24L01 Wiring**
+
+### NRF24L01+ to Waveshare ESP32-S3 Header
+| Wire Color | NRF Function | ESP32 Pin | Function |
+| :--- | :--- | :--- | :--- |
+| **Blue** | VCC | **3V3** | Power (3.3V) |
+| **Black** | GND | **G** | Ground |
+| **White** | CE | **38** | Chip Enable |
+| **Green** | CSN | **39** | Chip Select |
+| **Grey** | SCK | **40** | SPI Clock |
+| **Yellow** | MOSI | **41** | SPI MOSI |
+| **Purple** | MISO | **42** | SPI MISO |
+| **Orange** | IRQ | **N/C** | Not Connected |
+
+**Driver Implementation Notes:**
+- Initialize SPI bus with: `SCK=40, MOSI=41, MISO=42`
+- Initialize Radio with: `CE=38, CSN=39`
+- WARNING: Do not use 5V on the VCC line.
