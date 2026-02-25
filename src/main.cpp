@@ -28,6 +28,8 @@ extern "C" {
 #define LCD_RST  -1
 #define LCD_HOR_RES 320
 #define LCD_VER_RES 480
+// Fixed display orientation (landscape) for this project.
+#define DISPLAY_ROTATION 3
 
 #define I2C_SDA 8
 #define I2C_SCL 7
@@ -45,6 +47,12 @@ extern "C" {
 #define NRF_SCK  40
 #define NRF_MOSI 41
 #define NRF_MISO 42
+
+// NRF52840 UART bridge pins (ESP32 side)
+// Wire nRF52840 TX -> ESP32 RX, and nRF52840 RX -> ESP32 TX.
+#define NRF52_UART_RX   44
+#define NRF52_UART_TX   43
+#define NRF52_UART_BAUD 115200
 
 // Audio
 #define I2S_PORT        I2S_NUM_0
@@ -75,8 +83,9 @@ static const uint32_t SCAN_INTERVAL_SIGNAL_FINDER_MS = 2000;
 static const uint32_t MODE_TOUCH_GUARD_MS = 400;
 
 // NRF Constants
-#define NRF_NUM_CHANNELS 128
+#define NRF_NUM_CHANNELS 126
 #define MAX_SNIFFER_LOGS 12
+static const uint8_t MAX_TERM_LINE_CHARS = 72;
 
 // UI Layout (Base)
 static int BTN_BACK_X = 236;
@@ -143,8 +152,13 @@ Arduino_GFX *gfx = new Arduino_ST7796(bus, LCD_RST, 0, true, LCD_HOR_RES, LCD_VE
 // NRF Object
 RF24 radio(NRF_CE, NRF_CSN);
 static bool g_nrf_ready = false;
+static bool g_nrf_handshake_ok = false;
+static uint32_t g_last_nrf_init_attempt_ms = 0;
 static uint8_t g_nrf_channel_buckets[NRF_NUM_CHANNELS];
 static String g_sniffer_logs[MAX_SNIFFER_LOGS]; // For Sniffer Mode
+HardwareSerial nrf52_uart(1);
+static bool g_nrf52_ready = false;
+static String g_nrf52_line;
 
 static es8311_handle_t g_es8311 = nullptr;
 static bool g_audio_ready = false;
@@ -168,7 +182,6 @@ static bool g_touch_press_src = false;
 static bool g_radar_ui_static_ready = false;
 static bool g_radar_ui_has_sig = false;
 static uint32_t g_radar_ui_last_sig = 0;
-static uint8_t g_display_rotation = 0;
 static int g_last_tap_device = -1;
 static bool g_last_tap_selected = false;
 static uint32_t g_last_tap_feedback_until_ms = 0;
@@ -216,6 +229,7 @@ static void draw_nrf_ui(bool full_redraw);
 static void draw_tri_band_ui(bool full_redraw);
 static void draw_sniffer_ui(bool full_redraw);
 static void nrf_scan_channels();
+static void nrf52_bridge_tick();
 
 // --- HELPER FUNCTIONS ---
 static float clamp01(float v) {
@@ -234,8 +248,6 @@ static uint32_t hash_text_prefix(const String &s, size_t max_chars) {
   for (size_t i = 0; i < n; ++i) h = hash_mix_u32(h, uint8_t(s.charAt(i)));
   return h;
 }
-
-static bool is_landscape_rotation(uint8_t rot) { return (rot == 1u) || (rot == 3u); }
 
 static int radar_rows_visible() {
   const int usable_h = gfx->height() - RADAR_LIST_Y - 6;
@@ -261,24 +273,16 @@ static ScanSourceMode scan_source_for_mode(AppMode mode) {
 static bool scan_mode_uses_wifi() { return g_app_mode == APP_WIFI_SCAN; }
 static bool scan_mode_uses_ble() { return g_app_mode == APP_BLE_SCAN; }
 
-static void update_ui_layout_for_rotation() {
+static void update_ui_layout_fixed() {
   const int w = gfx->width();
-  const int h = gfx->height();
-  if (is_landscape_rotation(g_display_rotation)) {
-    BTN_BACK_W = 84; BTN_BACK_H = 28;
-    BTN_BACK_X = w - BTN_BACK_W - 8; BTN_BACK_Y = 6;
-    BTN_CAL_W = 84; BTN_CAL_H = 28;
-    BTN_CAL_X = BTN_BACK_X; BTN_CAL_Y = 38;
-    BTN_LBEEP_W = 84; BTN_LBEEP_H = 28;
-    BTN_LBEEP_X = BTN_BACK_X; BTN_LBEEP_Y = 70;
-    RADAR_LIST_X = 8; RADAR_LIST_Y = 56;
-    RADAR_LIST_W = w - 16; RADAR_ROW_H = 42;
-  } else {
-    BTN_BACK_X = 236; BTN_BACK_Y = 6; BTN_BACK_W = 76; BTN_BACK_H = 28;
-    BTN_CAL_X = 236; BTN_CAL_Y = 38; BTN_CAL_W = 76; BTN_CAL_H = 28;
-    BTN_LBEEP_X = 236; BTN_LBEEP_Y = 70; BTN_LBEEP_W = 76; BTN_LBEEP_H = 28;
-    RADAR_LIST_X = 8; RADAR_LIST_Y = 96; RADAR_LIST_W = 304; RADAR_ROW_H = 44;
-  }
+  BTN_BACK_W = 84; BTN_BACK_H = 28;
+  BTN_BACK_X = w - BTN_BACK_W - 8; BTN_BACK_Y = 6;
+  BTN_CAL_W = 84; BTN_CAL_H = 28;
+  BTN_CAL_X = BTN_BACK_X; BTN_CAL_Y = 38;
+  BTN_LBEEP_W = 84; BTN_LBEEP_H = 28;
+  BTN_LBEEP_X = BTN_BACK_X; BTN_LBEEP_Y = 70;
+  RADAR_LIST_X = 8; RADAR_LIST_Y = 56;
+  RADAR_LIST_W = w - 16; RADAR_ROW_H = 42;
 }
 
 static void reset_ui_draw_state() {
@@ -292,32 +296,12 @@ static void reset_ui_draw_state() {
   g_level_prev_dot_valid = false;
 }
 
-static void apply_display_rotation(uint8_t rotation, bool force_redraw = true) {
-  rotation &= 0x03;
-  if (rotation == g_display_rotation) return;
-  g_display_rotation = rotation;
-  gfx->setRotation(g_display_rotation);
-  update_ui_layout_for_rotation();
-  reset_ui_draw_state();
-  g_mode_enter_ms = millis();
-  g_last_frame_ms = g_mode_enter_ms - FRAME_INTERVAL_MS;
-
-  if (force_redraw) {
-    if (g_app_mode == APP_TRI_BAND) draw_tri_band_ui(true);
-    else if (g_app_mode == APP_SNIFFER) draw_sniffer_ui(true);
-    else if (g_app_mode == APP_NRF) draw_nrf_ui(true);
-    else if (g_app_mode == APP_LEVEL_ONLY) draw_level_only_ui();
-    else draw_radar_ui();
-  }
-}
-
 static bool read_touch_point(int16_t &x, int16_t &y) {
   int16_t tx[1] = {0}; int16_t ty[1] = {0};
   if (touch.getPoint(tx, ty, 1) <= 0) return false;
-  int16_t mx = tx[0]; int16_t my = ty[0];
-  if (g_display_rotation == 1) { mx = ty[0]; my = int16_t((LCD_HOR_RES - 1) - tx[0]); }
-  else if (g_display_rotation == 2) { mx = int16_t((LCD_HOR_RES - 1) - mx); my = int16_t((LCD_VER_RES - 1) - my); }
-  else if (g_display_rotation == 3) { mx = int16_t((LCD_VER_RES - 1) - ty[0]); my = tx[0]; }
+  // Fixed mapping for DISPLAY_ROTATION = 3 (landscape).
+  int16_t mx = int16_t((LCD_VER_RES - 1) - ty[0]);
+  int16_t my = tx[0];
   
   if (mx < 0) mx = 0; if (mx >= gfx->width()) mx = gfx->width() - 1;
   if (my < 0) my = 0; if (my >= gfx->height()) my = gfx->height() - 1;
@@ -363,6 +347,49 @@ static void draw_touch_button(int x, int y, int w, int h, const char *label, uin
   gfx->print(label);
 }
 
+static void push_terminal_log(const String &line) {
+  for (int k = MAX_SNIFFER_LOGS - 1; k > 0; --k) g_sniffer_logs[k] = g_sniffer_logs[k - 1];
+  g_sniffer_logs[0] = line;
+}
+
+static void nrf52_init_uart() {
+  nrf52_uart.begin(NRF52_UART_BAUD, SERIAL_8N1, NRF52_UART_RX, NRF52_UART_TX);
+  g_nrf52_ready = true;
+  Serial.printf("[NRF52] UART bridge ready @ %lu baud (RX=%d TX=%d)\n", (unsigned long)NRF52_UART_BAUD, NRF52_UART_RX, NRF52_UART_TX);
+  push_terminal_log(String("[52] UART ready @") + String(NRF52_UART_BAUD));
+}
+
+static void nrf52_bridge_tick() {
+  if (!g_nrf52_ready) return;
+
+  while (nrf52_uart.available() > 0) {
+    const int r = nrf52_uart.read();
+    if (r < 0) break;
+    const char c = char(r);
+
+    // Forward nRF52 output to USB serial for direct console interaction.
+    Serial.write((uint8_t)c);
+
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (g_nrf52_line.length() > 0) {
+        push_terminal_log(String("[52] ") + g_nrf52_line);
+        g_nrf52_line = "";
+      }
+      continue;
+    }
+
+    if (((c >= 32) && (c <= 126)) || (c == '\t')) {
+      if (g_nrf52_line.length() < MAX_TERM_LINE_CHARS) g_nrf52_line += c;
+    }
+  }
+
+  // Pass user-entered USB serial data through to nRF52 UART.
+  while (Serial.available() > 0) {
+    nrf52_uart.write((uint8_t)Serial.read());
+  }
+}
+
 // --- INIT FUNCTIONS ---
 static void tca9554_init_and_lcd_reset() {
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -389,16 +416,59 @@ static bool touch_init() {
   return true;
 }
 
-static bool nrf_init() {
-  if (g_nrf_ready) return true;
-  SPI.begin(NRF_SCK, NRF_MISO, NRF_MOSI, NRF_CSN);
-  if (!radio.begin(&SPI)) return false;
-  radio.setPALevel(RF24_PA_MAX);
-  radio.setDataRate(RF24_2MBPS);
-  radio.setAutoAck(false);
+static bool nrf_channel_has_signal(uint8_t channel, uint16_t dwell_us = 140) {
+  radio.setChannel(channel);
   radio.startListening();
+  delayMicroseconds(dwell_us);
+  const bool rpd_now = radio.testRPD();
+  const bool carrier_now = radio.testCarrier();
+  const bool data_pending = radio.available();
   radio.stopListening();
+  const bool rpd_after = radio.testRPD();
+  const bool carrier_after = radio.testCarrier();
+  if (data_pending) radio.flush_rx();
+  return rpd_now || carrier_now || rpd_after || carrier_after || data_pending;
+}
+
+static bool nrf_init() {
+  const uint32_t now = millis();
+  if (g_nrf_ready) return true;
+  if ((g_last_nrf_init_attempt_ms != 0) && ((now - g_last_nrf_init_attempt_ms) < 1200)) return false;
+  g_last_nrf_init_attempt_ms = now;
+
+  static const uint8_t noise_addr[6][2] = {
+    {0x55, 0x55}, {0xAA, 0xAA}, {0xA0, 0xAA},
+    {0xAB, 0xAA}, {0xAC, 0xAA}, {0xAD, 0xAA}
+  };
+
+  SPI.begin(NRF_SCK, NRF_MISO, NRF_MOSI, NRF_CSN);
+  if (!radio.begin(&SPI)) {
+    g_nrf_handshake_ok = false;
+    Serial.println("[NRF] begin() failed");
+    return false;
+  }
+  if (!radio.isChipConnected()) {
+    g_nrf_handshake_ok = false;
+    Serial.println("[NRF] SPI handshake failed (chip not responding)");
+    return false;
+  }
+
+  radio.stopListening();
+  radio.setAutoAck(false);
+  radio.disableCRC();
+  radio.setAddressWidth(2);
+  for (uint8_t i = 0; i < 6; ++i) radio.openReadingPipe(i, noise_addr[i]);
+
+  radio.setPALevel(RF24_PA_MAX, true); // max output power
+  if (!radio.setDataRate(RF24_1MBPS)) radio.setDataRate(RF24_2MBPS);
+
+  radio.startListening();
+  delayMicroseconds(140);
+  radio.stopListening();
+  radio.flush_rx();
   g_nrf_ready = true;
+  g_nrf_handshake_ok = true;
+  Serial.println("[NRF] handshake OK, PA=MAX, rate=1Mbps");
   return true;
 }
 
@@ -438,56 +508,42 @@ static void update_imu_heading() {
 
 // --- MENU & STARTUP ---
 static int startup_mode_hit_test(int16_t x, int16_t y) {
-  const int rotate_w = 84; const int rotate_h = 28;
-  const int rotate_x = gfx->width() - rotate_w - 8; const int rotate_y = 14;
-  if (point_in_rect(x, y, rotate_x, rotate_y, rotate_w, rotate_h)) return 100;
-
   const int w = gfx->width();
-  if (is_landscape_rotation(g_display_rotation)) {
-    const int card_w = (w - 40) / 3;
-    const int card_h = (gfx->height() - 126) / 2 - 5;
-    const int y0 = 108;
-    for (int i = 0; i < 3; ++i) if (point_in_rect(x, y, 8 + (i * (card_w + 12)), y0, card_w, card_h)) return i;
-    for (int i = 0; i < 3; ++i) if (point_in_rect(x, y, 8 + (i * (card_w + 12)), y0 + card_h + 10, card_w, card_h)) return i+3;
-  }
+  const int card_w = (w - 40) / 3;
+  const int card_h = (gfx->height() - 126) / 2 - 5;
+  const int y0 = 108;
+  for (int i = 0; i < 3; ++i) if (point_in_rect(x, y, 8 + (i * (card_w + 12)), y0, card_w, card_h)) return i;
+  for (int i = 0; i < 3; ++i) if (point_in_rect(x, y, 8 + (i * (card_w + 12)), y0 + card_h + 10, card_w, card_h)) return i + 3;
   return -1;
 }
 
 static void draw_startup_mode_menu(int highlighted_mode) {
   const int w = gfx->width();
   const int h = gfx->height();
-  const bool landscape = is_landscape_rotation(g_display_rotation);
 
   gfx->fillScreen(BLACK);
   gfx->setTextColor(WHITE); gfx->setTextSize(2);
   gfx->setCursor(16, 18); gfx->println("Select Tool");
-
-  const int rotate_w = 84; const int rotate_h = 28;
-  const int rotate_x = w - rotate_w - 8; const int rotate_y = 14;
-  gfx->drawRoundRect(rotate_x, rotate_y, rotate_w, rotate_h, 6, LIGHTGREY);
-  gfx->setTextSize(1); gfx->setCursor(rotate_x + 16, rotate_y + 10); gfx->print("ROTATE");
 
   const char *title[] = {"WiFi Scan", "BLE Scan", "NRF Spec", "Tri-Band", "Sniffer", "Level"};
   const char *sub[] = {"2.4GHz APs", "BLE Tags", "Spectrum", "All-Eye", "Packet Log", "Bubble"};
   const uint16_t fill_lo[] = {0x1082, 0x0822, 0x2104, MAROON, DARKGREEN, NAVY};
   const uint16_t fill_hi[] = {DARKGREEN, 0x03A8, ORANGE, RED, GREEN, BLUE};
 
-  if (landscape) {
-     const int card_w = (w - 40) / 3;
-     const int card_h = (h - 126) / 2 - 5;
-     const int y0 = 108;
-     for(int i=0; i<6; i++) {
-        int r = (i < 3) ? 0 : 1;
-        int c = (i < 3) ? i : (i-3);
-        int x = 8 + (c * (card_w + 12));
-        int y = y0 + (r * (card_h + 10));
-        bool hi = (highlighted_mode == i);
-        gfx->fillRoundRect(x, y, card_w, card_h, 8, hi ? fill_hi[i] : fill_lo[i]);
-        gfx->drawRoundRect(x, y, card_w, card_h, 8, WHITE);
-        gfx->setTextSize(2); gfx->setTextColor(WHITE);
-        gfx->setCursor(x+5, y+10); gfx->println(title[i]);
-        gfx->setTextSize(1); gfx->setCursor(x+5, y+30); gfx->println(sub[i]);
-     }
+  const int card_w = (w - 40) / 3;
+  const int card_h = (h - 126) / 2 - 5;
+  const int y0 = 108;
+  for (int i = 0; i < 6; i++) {
+    int r = (i < 3) ? 0 : 1;
+    int c = (i < 3) ? i : (i - 3);
+    int x = 8 + (c * (card_w + 12));
+    int y = y0 + (r * (card_h + 10));
+    bool hi = (highlighted_mode == i);
+    gfx->fillRoundRect(x, y, card_w, card_h, 8, hi ? fill_hi[i] : fill_lo[i]);
+    gfx->drawRoundRect(x, y, card_w, card_h, 8, WHITE);
+    gfx->setTextSize(2); gfx->setTextColor(WHITE);
+    gfx->setCursor(x + 5, y + 10); gfx->println(title[i]);
+    gfx->setTextSize(1); gfx->setCursor(x + 5, y + 30); gfx->println(sub[i]);
   }
 }
 
@@ -510,7 +566,6 @@ static AppMode select_startup_mode_touch() {
     if (touched) { was_pressed = true; press_mode = hit_mode; }
     else if (was_pressed) {
       was_pressed = false;
-      if (press_mode == 100) { apply_display_rotation((g_display_rotation + 1) & 0x03, false); menu_drawn = false; press_mode = -1; continue; }
       if (press_mode >= 0 && press_mode <= 5) return (AppMode)press_mode;
     }
     delay(20);
@@ -566,34 +621,32 @@ static void draw_tri_band_ui(bool full_redraw) {
   if (!g_nrf_ready) nrf_init();
   nrf_scan_channels();
   int base_y = h_third * 2;
+  int chart_y = base_y + 20;
   int chart_h = h_third - 20;
-  int bar_w = w / NRF_NUM_CHANNELS;
-  if (bar_w < 2) bar_w = 2;
+  int chart_bottom = chart_y + chart_h;
   gfx->setTextColor(YELLOW); gfx->setCursor(5, base_y + 5); gfx->print("ZONE 3: 2.4GHz Spectrum");
 
   for (int i = 0; i < NRF_NUM_CHANNELS; i++) {
-     int x = i * bar_w;
-     int val = g_nrf_channel_buckets[i];
-     int bar_h = map(val, 0, 255, 0, chart_h);
-     uint16_t col = (val > 150) ? RED : (val > 50 ? YELLOW : DARKGREEN);
-     gfx->drawFastVLine(x, base_y + 20, chart_h, BLACK);
-     if (bar_h > 0) gfx->fillRect(x, (base_y + 20 + chart_h) - bar_h, bar_w-1, bar_h, col);
+     const int x0 = (int)((int32_t(i) * w) / NRF_NUM_CHANNELS);
+     int x1 = (int)((int32_t(i + 1) * w) / NRF_NUM_CHANNELS);
+     if (x1 <= x0) x1 = x0 + 1;
+     const int bar_w = x1 - x0;
+     const int val = g_nrf_channel_buckets[i];
+     const int bar_h = map(val, 0, 255, 0, chart_h);
+     const uint16_t col = (val > 150) ? RED : (val > 50 ? YELLOW : DARKGREEN);
+     gfx->fillRect(x0, chart_y, bar_w, chart_h, BLACK);
+     if (bar_h > 0) gfx->fillRect(x0, chart_bottom - bar_h, bar_w, bar_h, col);
   }
 }
 
 // --- SNIFFER LOGIC ---
 static void nrf_sniffer_loop() {
-  if (!g_nrf_ready) nrf_init();
-  for (int i=0; i<NRF_NUM_CHANNELS; i+=2) {
-    radio.setChannel(i);
-    radio.startListening();
-    delayMicroseconds(120);
-    bool hit = radio.testCarrier();
-    radio.stopListening();
+  if (!g_nrf_ready && !nrf_init()) return;
+  for (int i = 0; i < NRF_NUM_CHANNELS; i++) {
+    const bool hit = nrf_channel_has_signal((uint8_t)i, 180);
     if (hit) {
-      String l = "EVENT: Ch " + String(i) + " [" + String(millis()) + "]";
-      for(int k=MAX_SNIFFER_LOGS-1; k>0; k--) g_sniffer_logs[k] = g_sniffer_logs[k-1];
-      g_sniffer_logs[0] = l;
+      String l = String("[24] Ch ") + String(i) + " [" + String(millis()) + "]";
+      push_terminal_log(l);
       delay(2);
     }
   }
@@ -603,11 +656,25 @@ static void draw_sniffer_ui(bool full_redraw) {
   if (full_redraw) {
     gfx->fillScreen(BLACK);
     gfx->setTextColor(GREEN); gfx->setTextSize(2);
-    gfx->setCursor(10, 10); gfx->print("HACKER TERMINAL");
+    gfx->setCursor(10, 10); gfx->print("RF TERMINAL");
     gfx->drawFastHLine(0, 35, gfx->width(), GREEN);
     draw_touch_button(BTN_BACK_X, BTN_BACK_Y, BTN_BACK_W, BTN_BACK_H, "BACK", 0x2104, LIGHTGREY, WHITE);
   }
   nrf_sniffer_loop();
+  gfx->setTextSize(1);
+  gfx->setTextColor(g_nrf52_ready ? CYAN : RED);
+  gfx->fillRect(10, 38, gfx->width() - 20, 10, BLACK);
+  gfx->setCursor(10, 38);
+  gfx->print(g_nrf52_ready ? "24:scanner 52:UART bridge active" : "NRF52 UART bridge unavailable");
+
+  if (!g_nrf_ready) {
+    const bool init_attempted = (g_last_nrf_init_attempt_ms != 0);
+    const bool init_failed = init_attempted && !g_nrf_handshake_ok;
+    gfx->setTextColor(init_failed ? RED : YELLOW);
+    gfx->setCursor(10, 50);
+    gfx->print(init_failed ? "NRF24 handshake failed" : "NRF24 init pending...");
+    return;
+  }
   gfx->setTextSize(2);
   for (int i=0; i<MAX_SNIFFER_LOGS; i++) {
     int y = 50 + (i * 25);
@@ -621,37 +688,61 @@ static void draw_sniffer_ui(bool full_redraw) {
 
 // --- NRF SCANNER LOGIC ---
 static void nrf_scan_channels() {
-  if (!g_nrf_ready) nrf_init();
-  for (int i = 0; i < 128; i++) {
-    radio.setChannel(i);
-    radio.startListening();
-    delayMicroseconds(50);
-    if (radio.testCarrier()) { if (g_nrf_channel_buckets[i] < 250) g_nrf_channel_buckets[i] += 10; } 
-    else { if (g_nrf_channel_buckets[i] > 2) g_nrf_channel_buckets[i] -= 3; }
-    radio.stopListening();
+  if (!g_nrf_ready && !nrf_init()) return;
+
+  static const rf24_datarate_e k_scan_rates[] = {RF24_1MBPS, RF24_2MBPS, RF24_250KBPS};
+  uint8_t hit_counts[NRF_NUM_CHANNELS] = {0};
+
+  for (size_t r = 0; r < (sizeof(k_scan_rates) / sizeof(k_scan_rates[0])); ++r) {
+    radio.setDataRate(k_scan_rates[r]);
+    for (int i = 0; i < NRF_NUM_CHANNELS; i++) {
+      if (nrf_channel_has_signal((uint8_t)i, 160) && (hit_counts[i] < 255)) hit_counts[i]++;
+    }
+  }
+
+  radio.setDataRate(RF24_1MBPS);
+
+  for (int i = 0; i < NRF_NUM_CHANNELS; i++) {
+    const uint8_t hits = hit_counts[i];
+    if (hits > 0) {
+      const uint16_t add = uint16_t(6 + (hits * 16));
+      const uint16_t next = uint16_t(g_nrf_channel_buckets[i]) + add;
+      g_nrf_channel_buckets[i] = (next > 255u) ? 255u : uint8_t(next);
+    } else {
+      const uint8_t decay = (g_nrf_channel_buckets[i] > 90) ? 4 : 2;
+      g_nrf_channel_buckets[i] = (g_nrf_channel_buckets[i] > decay) ? (g_nrf_channel_buckets[i] - decay) : 0;
+    }
   }
 }
 
 static void draw_nrf_ui(bool full_redraw) {
+  const int chart_left = 12;
+  const int chart_top = 60;
+  const int chart_bottom = gfx->height() - 21;
+  const int chart_h = chart_bottom - chart_top;
+  const int chart_w = gfx->width() - chart_left - 6;
+
   if (full_redraw) {
     gfx->fillScreen(BLACK);
     gfx->setTextColor(WHITE); gfx->setTextSize(2); gfx->setCursor(8, 8); gfx->println("2.4GHz Spectrum");
     draw_touch_button(BTN_BACK_X, BTN_BACK_Y, BTN_BACK_W, BTN_BACK_H, "BACK", 0x2104, LIGHTGREY, WHITE);
-    gfx->drawFastHLine(10, gfx->height() - 20, 300, WHITE);
-    gfx->drawFastVLine(10, 60, gfx->height() - 80, WHITE);
+    gfx->drawFastHLine(chart_left - 2, chart_bottom + 1, chart_w + 2, WHITE);
+    gfx->drawFastVLine(chart_left - 2, chart_top, chart_h + 2, WHITE);
     gfx->setTextSize(1); gfx->setTextColor(LIGHTGREY);
-    gfx->setCursor(10, gfx->height() - 10); gfx->print("2.400");
-    gfx->setCursor(260, gfx->height() - 10); gfx->print("2.525");
+    gfx->setCursor(chart_left - 2, gfx->height() - 10); gfx->print("2.400");
+    gfx->setCursor(gfx->width() - 46, gfx->height() - 10); gfx->print("2.525");
   }
-  int chart_bottom = gfx->height() - 21;
-  int chart_h = gfx->height() - 100;
-  for (int i = 0; i < 128; i++) {
-    int x = 12 + (i * 2.3);
-    int h = map(g_nrf_channel_buckets[i], 0, 255, 0, chart_h);
-    uint16_t color = (h > chart_h/2) ? RED : (h > 10 ? YELLOW : GREEN);
-    gfx->drawFastVLine(x, chart_bottom - chart_h, chart_h, BLACK);
-    gfx->drawFastVLine(x+1, chart_bottom - chart_h, chart_h, BLACK);
-    if (h > 0) gfx->fillRect(x, chart_bottom - h, 2, h, color);
+
+  for (int i = 0; i < NRF_NUM_CHANNELS; i++) {
+    const int x0 = chart_left + (int)((int32_t(i) * chart_w) / NRF_NUM_CHANNELS);
+    int x1 = chart_left + (int)((int32_t(i + 1) * chart_w) / NRF_NUM_CHANNELS);
+    if (x1 <= x0) x1 = x0 + 1;
+    const int bar_w = x1 - x0;
+    const int val = g_nrf_channel_buckets[i];
+    const int bar_h = map(val, 0, 255, 0, chart_h);
+    const uint16_t color = (val > 150) ? RED : (val > 50 ? YELLOW : GREEN);
+    gfx->fillRect(x0, chart_top, bar_w, chart_h, BLACK);
+    if (bar_h > 0) gfx->fillRect(x0, chart_bottom - bar_h, bar_w, bar_h, color);
   }
 }
 
@@ -906,16 +997,19 @@ void setup() {
   tca9554_init_and_lcd_reset();
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
   gfx->begin(40000000);
-  gfx->setRotation(g_display_rotation);
-  update_ui_layout_for_rotation();
+  gfx->setRotation(DISPLAY_ROTATION);
+  update_ui_layout_fixed();
   g_touch_ready = touch_init();
   g_imu_ready = imu_init();
+  nrf52_init_uart();
+  nrf_init(); // Verify NRF handshake early so wiring issues are visible on Serial at boot.
   g_app_mode = select_startup_mode_touch();
   apply_app_mode(g_app_mode);
 }
 
 void loop() {
   const uint32_t now = millis();
+  nrf52_bridge_tick();
   update_imu_heading();
 
   if (g_touch_ready && ((now - g_mode_enter_ms) >= MODE_TOUCH_GUARD_MS)) {
