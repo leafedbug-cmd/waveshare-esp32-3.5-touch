@@ -41,18 +41,14 @@ extern "C" {
 
 #define BOOT_BUTTON_PIN 0
 
-// NRF24 Pins
-#define NRF_CE   38
-#define NRF_CSN  39
-#define NRF_SCK  40
-#define NRF_MOSI 41
-#define NRF_MISO 42
-
-// NRF52840 UART bridge pins (ESP32 side)
-// Wire nRF52840 TX -> ESP32 RX, and nRF52840 RX -> ESP32 TX.
-#define NRF52_UART_RX   44
-#define NRF52_UART_TX   43
-#define NRF52_UART_BAUD 115200
+// NRF24L01 Pins — shared SPI bus, separate CE/CSN per radio
+#define NRF_CE_A  38
+#define NRF_CSN_A 39
+#define NRF_SCK   40
+#define NRF_MOSI  41
+#define NRF_MISO  42
+#define NRF_CE_B  43
+#define NRF_CSN_B 44
 
 // Audio
 #define I2S_PORT        I2S_NUM_0
@@ -149,16 +145,16 @@ IMUdata gyr;
 Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, SPI_SCLK, SPI_MOSI, SPI_MISO);
 Arduino_GFX *gfx = new Arduino_ST7796(bus, LCD_RST, 0, true, LCD_HOR_RES, LCD_VER_RES);
 
-// NRF Object
-RF24 radio(NRF_CE, NRF_CSN);
+// NRF24 Objects — two radios on shared SPI bus
+RF24 radio(NRF_CE_A, NRF_CSN_A);
+RF24 radioB(NRF_CE_B, NRF_CSN_B);
 static bool g_nrf_ready = false;
 static bool g_nrf_handshake_ok = false;
+static bool g_nrf_ready_b = false;
+static bool g_nrf_handshake_b = false;
 static uint32_t g_last_nrf_init_attempt_ms = 0;
 static uint8_t g_nrf_channel_buckets[NRF_NUM_CHANNELS];
-static String g_sniffer_logs[MAX_SNIFFER_LOGS]; // For Sniffer Mode
-HardwareSerial nrf52_uart(1);
-static bool g_nrf52_ready = false;
-static String g_nrf52_line;
+static String g_sniffer_logs[MAX_SNIFFER_LOGS];
 
 static es8311_handle_t g_es8311 = nullptr;
 static bool g_audio_ready = false;
@@ -229,7 +225,6 @@ static void draw_nrf_ui(bool full_redraw);
 static void draw_tri_band_ui(bool full_redraw);
 static void draw_sniffer_ui(bool full_redraw);
 static void nrf_scan_channels();
-static void nrf52_bridge_tick();
 
 // --- HELPER FUNCTIONS ---
 static float clamp01(float v) {
@@ -352,44 +347,6 @@ static void push_terminal_log(const String &line) {
   g_sniffer_logs[0] = line;
 }
 
-static void nrf52_init_uart() {
-  nrf52_uart.begin(NRF52_UART_BAUD, SERIAL_8N1, NRF52_UART_RX, NRF52_UART_TX);
-  g_nrf52_ready = true;
-  Serial.printf("[NRF52] UART bridge ready @ %lu baud (RX=%d TX=%d)\n", (unsigned long)NRF52_UART_BAUD, NRF52_UART_RX, NRF52_UART_TX);
-  push_terminal_log(String("[52] UART ready @") + String(NRF52_UART_BAUD));
-}
-
-static void nrf52_bridge_tick() {
-  if (!g_nrf52_ready) return;
-
-  while (nrf52_uart.available() > 0) {
-    const int r = nrf52_uart.read();
-    if (r < 0) break;
-    const char c = char(r);
-
-    // Forward nRF52 output to USB serial for direct console interaction.
-    Serial.write((uint8_t)c);
-
-    if (c == '\r') continue;
-    if (c == '\n') {
-      if (g_nrf52_line.length() > 0) {
-        push_terminal_log(String("[52] ") + g_nrf52_line);
-        g_nrf52_line = "";
-      }
-      continue;
-    }
-
-    if (((c >= 32) && (c <= 126)) || (c == '\t')) {
-      if (g_nrf52_line.length() < MAX_TERM_LINE_CHARS) g_nrf52_line += c;
-    }
-  }
-
-  // Pass user-entered USB serial data through to nRF52 UART.
-  while (Serial.available() > 0) {
-    nrf52_uart.write((uint8_t)Serial.read());
-  }
-}
-
 // --- INIT FUNCTIONS ---
 static void tca9554_init_and_lcd_reset() {
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -441,35 +398,51 @@ static bool nrf_init() {
     {0xAB, 0xAA}, {0xAC, 0xAA}, {0xAD, 0xAA}
   };
 
-  SPI.begin(NRF_SCK, NRF_MISO, NRF_MOSI, NRF_CSN);
+  SPI.begin(NRF_SCK, NRF_MISO, NRF_MOSI, NRF_CSN_A);
+
+  // --- Radio A ---
   if (!radio.begin(&SPI)) {
     g_nrf_handshake_ok = false;
-    Serial.println("[NRF] begin() failed");
-    return false;
-  }
-  if (!radio.isChipConnected()) {
+    Serial.println("[NRF-A] begin() failed");
+  } else if (!radio.isChipConnected()) {
     g_nrf_handshake_ok = false;
-    Serial.println("[NRF] SPI handshake failed (chip not responding)");
-    return false;
+    Serial.println("[NRF-A] SPI handshake failed");
+  } else {
+    radio.stopListening();
+    radio.setAutoAck(false);
+    radio.disableCRC();
+    radio.setAddressWidth(2);
+    for (uint8_t i = 0; i < 6; ++i) radio.openReadingPipe(i, noise_addr[i]);
+    radio.setPALevel(RF24_PA_MAX, true);
+    if (!radio.setDataRate(RF24_1MBPS)) radio.setDataRate(RF24_2MBPS);
+    radio.startListening(); delayMicroseconds(140); radio.stopListening(); radio.flush_rx();
+    g_nrf_ready = true;
+    g_nrf_handshake_ok = true;
+    Serial.println("[NRF-A] handshake OK");
   }
 
-  radio.stopListening();
-  radio.setAutoAck(false);
-  radio.disableCRC();
-  radio.setAddressWidth(2);
-  for (uint8_t i = 0; i < 6; ++i) radio.openReadingPipe(i, noise_addr[i]);
+  // --- Radio B ---
+  if (!radioB.begin(&SPI)) {
+    g_nrf_handshake_b = false;
+    Serial.println("[NRF-B] begin() failed");
+  } else if (!radioB.isChipConnected()) {
+    g_nrf_handshake_b = false;
+    Serial.println("[NRF-B] SPI handshake failed");
+  } else {
+    radioB.stopListening();
+    radioB.setAutoAck(false);
+    radioB.disableCRC();
+    radioB.setAddressWidth(2);
+    for (uint8_t i = 0; i < 6; ++i) radioB.openReadingPipe(i, noise_addr[i]);
+    radioB.setPALevel(RF24_PA_MAX, true);
+    if (!radioB.setDataRate(RF24_1MBPS)) radioB.setDataRate(RF24_2MBPS);
+    radioB.startListening(); delayMicroseconds(140); radioB.stopListening(); radioB.flush_rx();
+    g_nrf_ready_b = true;
+    g_nrf_handshake_b = true;
+    Serial.println("[NRF-B] handshake OK");
+  }
 
-  radio.setPALevel(RF24_PA_MAX, true); // max output power
-  if (!radio.setDataRate(RF24_1MBPS)) radio.setDataRate(RF24_2MBPS);
-
-  radio.startListening();
-  delayMicroseconds(140);
-  radio.stopListening();
-  radio.flush_rx();
-  g_nrf_ready = true;
-  g_nrf_handshake_ok = true;
-  Serial.println("[NRF] handshake OK, PA=MAX, rate=1Mbps");
-  return true;
+  return g_nrf_ready || g_nrf_ready_b;
 }
 
 // --- IMU LOGIC ---
