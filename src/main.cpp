@@ -28,8 +28,17 @@ extern "C" {
 #define LCD_RST  -1
 #define LCD_HOR_RES 320
 #define LCD_VER_RES 480
-// Fixed display orientation (landscape) for this project.
-#define DISPLAY_ROTATION 3
+// Single fixed display orientation for this project.
+// Do not change at runtime: this is the only supported orientation.
+#define DISPLAY_ROTATION 0
+
+// Touch fine-tune offsets after transform (pixels).
+#define TOUCH_X_OFFSET 0
+#define TOUCH_Y_OFFSET 0
+// Single fixed touch transform for DISPLAY_ROTATION=0 (Portrait, non-mirrored).
+#define TOUCH_SWAP_XY false
+#define TOUCH_MIRROR_X false
+#define TOUCH_MIRROR_Y false
 
 #define I2C_SDA 8
 #define I2C_SCL 7
@@ -143,7 +152,7 @@ IMUdata acc;
 IMUdata gyr;
 
 Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, SPI_SCLK, SPI_MOSI, SPI_MISO);
-Arduino_GFX *gfx = new Arduino_ST7796(bus, LCD_RST, 0, true, LCD_HOR_RES, LCD_VER_RES);
+Arduino_GFX *gfx = new Arduino_ST7796(bus, LCD_RST, DISPLAY_ROTATION, true, LCD_HOR_RES, LCD_VER_RES);
 
 // NRF24 Objects — two radios on shared SPI bus
 RF24 radio(NRF_CE_A, NRF_CSN_A);
@@ -294,9 +303,8 @@ static void reset_ui_draw_state() {
 static bool read_touch_point(int16_t &x, int16_t &y) {
   int16_t tx[1] = {0}; int16_t ty[1] = {0};
   if (touch.getPoint(tx, ty, 1) <= 0) return false;
-  // Fixed mapping for DISPLAY_ROTATION = 3 (landscape).
-  int16_t mx = int16_t((LCD_VER_RES - 1) - ty[0]);
-  int16_t my = tx[0];
+  int16_t mx = int16_t(tx[0] + TOUCH_X_OFFSET);
+  int16_t my = int16_t(ty[0] + TOUCH_Y_OFFSET);
   
   if (mx < 0) mx = 0; if (mx >= gfx->width()) mx = gfx->width() - 1;
   if (my < 0) my = 0; if (my >= gfx->height()) my = gfx->height() - 1;
@@ -370,6 +378,12 @@ static bool imu_init() {
 
 static bool touch_init() {
   if (!touch.begin(Wire, FT6X36_SLAVE_ADDRESS)) return false;
+  const uint16_t raw_x_max = LCD_HOR_RES - 1;
+  const uint16_t raw_y_max = LCD_VER_RES - 1;
+  touch.setSwapXY(TOUCH_SWAP_XY);
+  touch.setMirrorXY(TOUCH_MIRROR_X, TOUCH_MIRROR_Y);
+  touch.setMaxCoordinates(TOUCH_SWAP_XY ? raw_y_max : raw_x_max, TOUCH_SWAP_XY ? raw_x_max : raw_y_max);
+  Serial.printf("[TOUCH] swap=%u mirrorX=%u mirrorY=%u\n", TOUCH_SWAP_XY ? 1u : 0u, TOUCH_MIRROR_X ? 1u : 0u, TOUCH_MIRROR_Y ? 1u : 0u);
   return true;
 }
 
@@ -562,7 +576,8 @@ static void draw_tri_band_ui(bool full_redraw) {
   if (millis() - last_wifi > 5000) { WiFi.scanNetworks(true); last_wifi = millis(); }
   int n = WiFi.scanComplete();
   if (n >= 0) {
-    gfx->fillRect(0, 30, w, h_third - 30, BLACK);
+    gfx->fillRect(0, 0, w, h_third, BLACK);
+    gfx->drawFastHLine(0, h_third, w, WHITE);
     gfx->setTextColor(GREEN); gfx->setTextSize(1);
     gfx->setCursor(5, 5); gfx->print("ZONE 1: Wi-Fi APs");
     for (int i=0; i<min(n, 5); i++) {
@@ -577,7 +592,8 @@ static void draw_tri_band_ui(bool full_redraw) {
   static unsigned long last_ble = 0;
   if (millis() - last_ble > 2000) {
     BLEScanResults r = g_ble_scan->start(1, false);
-    gfx->fillRect(0, h_third + 20, w, h_third - 20, BLACK);
+    gfx->fillRect(0, h_third + 1, w, h_third - 1, BLACK);
+    gfx->drawFastHLine(0, h_third * 2, w, WHITE);
     gfx->setTextColor(CYAN);
     gfx->setCursor(5, h_third + 5); gfx->print("ZONE 2: BLE Devices");
     for (int i=0; i<min(r.getCount(), 5); i++) {
@@ -597,6 +613,7 @@ static void draw_tri_band_ui(bool full_redraw) {
   int chart_y = base_y + 20;
   int chart_h = h_third - 20;
   int chart_bottom = chart_y + chart_h;
+  gfx->fillRect(0, base_y + 1, w, 20, BLACK);
   gfx->setTextColor(YELLOW); gfx->setCursor(5, base_y + 5); gfx->print("ZONE 3: 2.4GHz Spectrum");
 
   for (int i = 0; i < NRF_NUM_CHANNELS; i++) {
@@ -945,6 +962,7 @@ static void draw_radar_ui() {
 // --- APP STATE MANAGEMENT ---
 static void apply_app_mode(AppMode mode) {
   g_app_mode = mode;
+  g_mode_enter_ms = millis();
   g_touch_was_pressed = false;
   reset_ui_draw_state();
   if (mode == APP_NRF) { WiFi.mode(WIFI_OFF); nrf_init(); draw_nrf_ui(true); }
@@ -971,6 +989,13 @@ void setup() {
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
   gfx->begin(40000000);
   gfx->setRotation(DISPLAY_ROTATION);
+  // Manual MADCTL override via bus to fix mirrored text for ST7796.
+  // 0x08: BGR=1 (Portrait, non-mirrored)
+  bus->beginWrite();
+  bus->writeCommand(0x36);
+  bus->write(0x08);
+  bus->endWrite();
+
   update_ui_layout_fixed();
   g_touch_ready = touch_init();
   g_imu_ready = imu_init();
@@ -1000,8 +1025,12 @@ void loop() {
      nrf_scan_channels();
      if ((now - g_last_frame_ms) > 50) { draw_nrf_ui(false); g_last_frame_ms = now; }
   }
-  else if (g_app_mode == APP_TRI_BAND) { draw_tri_band_ui(false); }
-  else if (g_app_mode == APP_SNIFFER) { draw_sniffer_ui(false); }
+  else if (g_app_mode == APP_TRI_BAND) {
+    if ((now - g_last_frame_ms) > 100) { draw_tri_band_ui(false); g_last_frame_ms = now; }
+  }
+  else if (g_app_mode == APP_SNIFFER) {
+    if ((now - g_last_frame_ms) > 100) { draw_sniffer_ui(false); g_last_frame_ms = now; }
+  }
   else if (g_app_mode == APP_LEVEL_ONLY) {
      if ((now - g_last_frame_ms) > FRAME_INTERVAL_MS) { draw_level_only_ui(); g_last_frame_ms = now; }
   }
